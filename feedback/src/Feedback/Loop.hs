@@ -62,16 +62,27 @@ runFeedbackLoop = do
   flags <- getFlags
   env <- getEnvironment
 
-  let doSingleLoop loopBegin = do
-        -- We show a 'preparing' chunk before we get the settings because sometimes
-        -- getting the settings can take a while, for example in big repositories.
-        putTimedChunks terminalCapabilities loopBegin [indicatorChunk "preparing"]
+  -- Make sure the user knows what's happening.
+  -- Note that this this must occur after the getFlags so that nothing is
+  -- output before the autocompletion options can be activated.
+  -- Otherwise the autocompletion output will fail to parse and autocomplete
+  -- breaks.
+  firstBegin <- getZonedTime
+  putTimedChunks terminalCapabilities firstBegin [indicatorChunk "preparing for first run"]
 
-        -- Get the loop configuration within the loop, so that the loop
-        -- configuration can be what is being worked on.
-        mConfiguration <- getConfiguration flags env
-        loopSettings <- combineToSettings flags env mConfiguration
+  -- Get the initial configuration so that we know if we need to run a hook after the first run.
+  mInitialConfiguration <- getConfiguration flags env
+  initialSettings <- combineToSettings flags env mInitialConfiguration
 
+  -- If a before-all hook is defined, run it now.
+  forM_ (hooksSettingBeforeAll (loopSettingHooksSettings initialSettings)) $ \beforeAllRunSettings -> do
+    putTimedChunks terminalCapabilities firstBegin [indicatorChunk "starting before-all hook"]
+    runHook terminalCapabilities firstBegin beforeAllRunSettings
+
+  -- Define how to run a single loop with given settings in a let binding so we
+  -- don't have to pass in args like 'here', 'stdinFilter' and
+  -- 'terminalCapabilities'.
+  let doSingleLoopWithSettings firstLoop loopBegin loopSettings = do
         FS.withManagerConf FS.defaultConfig $ \watchManager -> do
           -- Set up watchers for each relevant directory and send the FSNotify
           -- events down this event channel.
@@ -87,8 +98,24 @@ runFeedbackLoop = do
               eventChan
 
           -- Start the process and put output.
-          worker mainThreadId loopSettings terminalCapabilities loopBegin eventChan
-            `finally` stopListeningAction
+          worker mainThreadId firstLoop loopSettings terminalCapabilities loopBegin eventChan stopListeningAction
+
+  -- Do the first loop outside the 'forever' so we can run commands before and
+  -- after the first loop.
+  doSingleLoopWithSettings True firstBegin initialSettings
+    `finally` putDone terminalCapabilities firstBegin
+
+  let doSingleLoop loopBegin = do
+        -- We show a 'preparing' chunk before we get the settings because sometimes
+        -- getting the settings can take a while, for example in big repositories.
+        putTimedChunks terminalCapabilities loopBegin [indicatorChunk "preparing"]
+
+        -- Get the loop configuration within the loop, so that the loop
+        -- configuration can be what is being worked on.
+        mConfiguration <- getConfiguration flags env
+        loopSettings <- combineToSettings flags env mConfiguration
+
+        doSingleLoopWithSettings False loopBegin loopSettings
 
   let singleIteration = do
         -- Record when the loop began so we can show relative times nicely.
@@ -96,6 +123,13 @@ runFeedbackLoop = do
         doSingleLoop loopBegin `finally` putDone terminalCapabilities loopBegin
 
   forever singleIteration
+
+runHook :: TerminalCapabilities -> ZonedTime -> RunSettings -> IO ()
+runHook terminalCapabilities begin runSettings = do
+  mapM_ (putTimedChunks terminalCapabilities begin) (startingLines runSettings)
+  _ <- startProcessHandle runSettings
+  -- We want this process to keep running, so we don't wait for it.
+  pure ()
 
 startWatching ::
   Path Abs Dir ->
@@ -140,68 +174,100 @@ getTermCaps = pure WithoutColours
 data RestartEvent
   = FSEvent !FS.Event
   | StdinEvent !Char
-  deriving (Show, Eq)
 
-worker :: ThreadId -> LoopSettings -> TerminalCapabilities -> ZonedTime -> Chan FS.Event -> IO ()
-worker mainThreadId LoopSettings {..} terminalCapabilities loopBegin eventChan = do
-  let sendOutput :: Output -> IO ()
-      sendOutput = putOutput loopSettingOutputSettings terminalCapabilities loopBegin
+worker ::
+  ThreadId ->
+  Bool ->
+  LoopSettings ->
+  TerminalCapabilities ->
+  ZonedTime ->
+  Chan FS.Event ->
+  IO () ->
+  IO ()
+worker
+  mainThreadId
+  thisIsTheFirstLoop
+  LoopSettings {..}
+  terminalCapabilities
+  loopBegin
+  eventChan
+  stopListeningAction = do
+    let sendOutput :: Output -> IO ()
+        sendOutput = putOutput loopSettingOutputSettings terminalCapabilities loopBegin
 
-  -- Record starting time of the process.
-  -- This is different from 'loopBegin' because preparing the watchers may take
-  -- a nontrivial amount of time.
-  start <- getMonotonicTimeNSec
+    -- Record starting time of the process.
+    -- This is different from 'loopBegin' because preparing the watchers may take
+    -- a nontrivial amount of time.
+    start <- getMonotonicTimeNSec
 
-  -- Start the process process
-  processHandle <- startProcessHandle loopSettingRunSettings
-  sendOutput $ OutputProcessStarted loopSettingRunSettings
+    -- Start the process process
+    processHandle <- startProcessHandle loopSettingRunSettings
+    sendOutput $ OutputProcessStarted loopSettingRunSettings
 
-  -- Perform GC after the process has started, because that's when we're
-  -- waiting anyway, so that we don't need idle gc.
-  performGC
+    -- Perform GC after the process has started, because that's when we're
+    -- waiting anyway, so that we don't need idle gc.
+    performGC
 
-  -- Make sure we kill the process and wait for it to exit if a user presses
-  -- C-c.
-  installKillHandler mainThreadId processHandle
+    -- Make sure we kill the process and wait for it to exit if a user presses
+    -- C-c.
+    installKillHandler mainThreadId processHandle
 
-  -- From here on we will wait for either:
-  -- 1. A change to a file that we are watching, or
-  -- 2. The process to finish.
+    let runAfterFirstHookIfNecessary = do
+          -- If this is the first run AND a after-first hook is defined, run it now.
+          when thisIsTheFirstLoop $
+            forM_ (hooksSettingAfterFirst loopSettingHooksSettings) $ \afterFirstRunSettings -> do
+              putTimedChunks terminalCapabilities loopBegin [indicatorChunk "starting after-first hook"]
+              runHook terminalCapabilities loopBegin afterFirstRunSettings
+    -- From here on we will wait for either:
+    -- 1. A change to a file that we are watching, or
+    -- 2. The process to finish.
 
-  -- 1. If An event happened first, output it and kill the process.
-  let handleEventHappened event = do
-        -- Output the event that has fired
-        sendOutput $ OutputEvent event
-        -- Output that killing will start
-        sendOutput OutputKilling
-        -- Kill the process
-        stopProcessHandle processHandle
-        -- Output that the process has been killed
-        sendOutput OutputKilled
-        -- Wait for the process to finish (should have by now)
-        ec <- waitProcessHandle processHandle
-        -- Record the end time
-        end <- getMonotonicTimeNSec
-        -- Output that the process has finished
-        sendOutput $ OutputProcessExited ec (end - start)
+    -- 1. If An event happened first, output it and kill the process.
+    let handleEventHappened event = do
+          -- Output the event that has fired
+          sendOutput $ OutputEvent event
+          -- Output that we'll stop watching now
+          sendOutput OutputStopWatching
+          -- Stop watching
+          stopListeningAction
+          -- Output that killing will start
+          sendOutput OutputKilling
+          -- Kill the process
+          stopProcessHandle processHandle
+          -- Output that the process has been killed
+          sendOutput OutputKilled
+          -- Wait for the process to finish (should have by now)
+          ec <- waitProcessHandle processHandle
+          -- Record the end time
+          end <- getMonotonicTimeNSec
+          -- Output that the process has finished
+          sendOutput $ OutputProcessExited ec (end - start)
+          -- Process is done, run the after-first hook if necessary
+          runAfterFirstHookIfNecessary
 
-  -- 2. If the process finished first, show the result and wait for an event anyway
-  let handleProcessDone ec = do
-        end <- getMonotonicTimeNSec
-        sendOutput $ OutputProcessExited ec (end - start)
-        -- Output the event that made the rerun happen
-        event <- waitForEvent eventChan
-        sendOutput $ OutputEvent event
+    -- 2. If the process finished first, show the result and wait for an event anyway
+    let handleProcessDone ec = do
+          end <- getMonotonicTimeNSec
+          sendOutput $ OutputProcessExited ec (end - start)
+          -- Process is done, run the after-first hook if necessary
+          runAfterFirstHookIfNecessary
+          -- Output the event that made the rerun happen
+          event <- waitForEvent eventChan
+          sendOutput $ OutputEvent event
+          -- Output that we'll stop watching now
+          sendOutput OutputStopWatching
+          -- Stop watching
+          stopListeningAction
 
-  -- Either wait for it to finish or wait for an event
-  eventOrDone <-
-    race
-      (waitForEvent eventChan)
-      (waitProcessHandle processHandle)
+    -- Either wait for it to finish or wait for an event
+    eventOrDone <-
+      race
+        (waitForEvent eventChan)
+        (waitProcessHandle processHandle)
 
-  case eventOrDone of
-    Left event -> handleEventHappened event
-    Right ec -> handleProcessDone ec
+    case eventOrDone of
+      Left event -> handleEventHappened event
+      Right ec -> handleProcessDone ec
 
 installKillHandler :: ThreadId -> ProcessHandle -> IO ()
 installKillHandler mainThreadId processHandle = do
@@ -235,12 +301,12 @@ waitForEvent eventChan = do
 data Output
   = OutputFiltering
   | OutputWatching
+  | OutputStopWatching
   | OutputEvent !RestartEvent
   | OutputKilling
   | OutputKilled
   | OutputProcessStarted !RunSettings
   | OutputProcessExited !ExitCode !Word64
-  deriving (Show)
 
 putOutput :: OutputSettings -> TerminalCapabilities -> ZonedTime -> Output -> IO ()
 putOutput OutputSettings {..} terminalCapabilities loopBegin =
@@ -248,19 +314,24 @@ putOutput OutputSettings {..} terminalCapabilities loopBegin =
    in \case
         OutputFiltering -> put [indicatorChunk "filtering"]
         OutputWatching -> put [indicatorChunk "watching"]
+        OutputStopWatching -> put [indicatorChunk "stop watching"]
         OutputEvent restartEvent -> do
           put $
-            indicatorChunk "event:" :
-            " " : case restartEvent of
-              FSEvent fsEvent ->
-                [ case fsEvent of
-                    Added {} -> fore green " added    "
-                    Modified {} -> fore yellow " modified "
-                    Removed {} -> fore red " removed  "
-                    Unknown {} -> " unknown  ",
-                  chunk $ T.pack $ eventPath fsEvent
-                ]
-              StdinEvent c -> [fore magenta "manual restart: ", chunk $ T.pack $ show c]
+            indicatorChunk "event:"
+              : " "
+              : case restartEvent of
+                FSEvent fsEvent ->
+                  [ case fsEvent of
+                      Added {} -> fore green " added    "
+                      Modified {} -> fore yellow " modified "
+                      Removed {} -> fore red " removed  "
+                      Unknown {} -> " unknown  "
+                      ModifiedAttributes {} -> fore yellow " modified "
+                      WatchedDirectoryRemoved {} -> fore red " removed "
+                      CloseWrite {} -> fore yellow " modified ",
+                    chunk $ T.pack $ eventPath fsEvent
+                  ]
+                StdinEvent c -> [fore magenta "manual restart: ", chunk $ T.pack $ show c]
         OutputKilling -> put [indicatorChunk "killing"]
         OutputKilled -> put [indicatorChunk "killed"]
         OutputProcessStarted runSettings -> do

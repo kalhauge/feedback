@@ -32,7 +32,7 @@ combineToSettings flags@Flags {..} environment mConf = do
                   show flagCommand <> ",",
                   "interpreting it as a standalone command."
                 ]
-          pure $ makeLoopConfiguration $ CommandArgs flagCommand
+          pure $ makeLoopConfiguration $ CommandScript flagCommand
         Just config -> do
           putStrLn $
             unwords
@@ -70,7 +70,7 @@ prettyConfiguration mConf = case mConf of
       [""],
       layoutAsTable
         ( map
-            (uncurry loopConfigLine)
+            (pure . uncurry loopConfigLine)
             (M.toList (configLoops conf))
         ),
       [fore blue "Run ", fore yellow "feedback loopname", fore blue " to activate a feedback loop."]
@@ -78,6 +78,7 @@ prettyConfiguration mConf = case mConf of
 
 loopConfigLine :: String -> LoopConfiguration -> [Chunk]
 loopConfigLine loopName LoopConfiguration {..} =
-  [ loopNameChunk $ loopName <> ":",
+  [ loopNameChunk loopName,
+    ": ",
     maybe "no description" (chunk . T.pack) loopConfigDescription
   ]

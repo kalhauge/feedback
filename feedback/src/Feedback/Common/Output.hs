@@ -37,20 +37,11 @@ indicatorChunk = fore cyan . chunk . T.pack . printf "%-12s"
 loopNameChunk :: String -> Chunk
 loopNameChunk = fore yellow . chunk . T.pack
 
-commandChunk :: String -> Chunk
-commandChunk = fore blue . chunk . T.pack
-
 startingLines :: RunSettings -> [[Chunk]]
 startingLines RunSettings {..} =
   let RunSettings _ _ _ = undefined
    in concat
         [ case runSettingCommand of
-            CommandArgs command ->
-              [ [ indicatorChunk "starting",
-                  " ",
-                  commandChunk command
-                ]
-              ]
             CommandScript script ->
               [ [ indicatorChunk "starting script\n",
                   chunk $ T.pack script
@@ -65,16 +56,16 @@ startingLines RunSettings {..} =
           if null runSettingExtraEnv
             then []
             else
-              [indicatorChunk "extra env:"] :
-              map
-                ( \(k, v) ->
-                    [ "  ",
-                      fore blue $ chunk (T.pack k),
-                      ": ",
-                      fore blue $ chunk (T.pack v)
-                    ]
-                )
-                (M.toList runSettingExtraEnv)
+              [indicatorChunk "extra env:"]
+                : map
+                  ( \(k, v) ->
+                      [ "  ",
+                        fore blue $ chunk (T.pack k),
+                        ": ",
+                        fore blue $ chunk (T.pack v)
+                      ]
+                  )
+                  (M.toList runSettingExtraEnv)
         ]
 
 exitCodeChunks :: ExitCode -> [Chunk]
@@ -95,5 +86,6 @@ durationChunks nanosecs =
    in [ indicatorChunk "took",
         " ",
         chunk $
-          T.pack $ printf "%4.2fs" diffTime
+          T.pack $
+            printf "%4.2fs" diffTime
       ]

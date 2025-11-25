@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedLists #-}
@@ -16,11 +15,9 @@ import qualified Data.Map as M
 import Data.Maybe
 import qualified Data.Text as T
 import Data.Version
-import Data.Yaml (FromJSON, ToJSON)
 import qualified Env
-import GHC.Generics (Generic)
 import Options.Applicative as OptParse
-import qualified Options.Applicative.Help as OptParse (string)
+import qualified Options.Applicative.Help as OptParse (pretty)
 import Path
 import Path.IO
 import Paths_feedback
@@ -28,9 +25,10 @@ import Paths_feedback
 data LoopSettings = LoopSettings
   { loopSettingRunSettings :: !RunSettings,
     loopSettingFilterSettings :: !FilterSettings,
-    loopSettingOutputSettings :: !OutputSettings
+    loopSettingOutputSettings :: !OutputSettings,
+    loopSettingHooksSettings :: !HooksSettings
   }
-  deriving (Show, Eq, Generic)
+  deriving (Show)
 
 combineToLoopSettings :: Flags -> Environment -> Maybe OutputConfiguration -> LoopConfiguration -> IO LoopSettings
 combineToLoopSettings Flags {..} Environment {} mDefaultOutputConfig LoopConfiguration {..} = do
@@ -39,6 +37,7 @@ combineToLoopSettings Flags {..} Environment {} mDefaultOutputConfig LoopConfigu
 
   let outputConfig = maybe loopConfigOutputConfiguration (<> loopConfigOutputConfiguration) mDefaultOutputConfig
   let loopSettingOutputSettings = combineToOutputSettings flagOutputFlags outputConfig
+  loopSettingHooksSettings <- combineToHooksSettings loopConfigHooksConfiguration
   pure LoopSettings {..}
 
 data RunSettings = RunSettings
@@ -46,7 +45,7 @@ data RunSettings = RunSettings
     runSettingExtraEnv :: !(Map String String),
     runSettingWorkingDir :: !(Maybe (Path Abs Dir))
   }
-  deriving (Show, Eq, Generic)
+  deriving (Show)
 
 combineToRunSettings :: RunConfiguration -> IO RunSettings
 combineToRunSettings RunConfiguration {..} = do
@@ -55,22 +54,22 @@ combineToRunSettings RunConfiguration {..} = do
   runSettingWorkingDir <- mapM resolveDir' runConfigWorkingDir
   pure RunSettings {..}
 
-data OutputSettings = OutputSettings
-  { outputSettingClear :: !Clear
-  }
-  deriving (Show, Eq, Generic)
-
 data FilterSettings = FilterSettings
   { filterSettingGitignore :: !Bool,
     filterSettingFind :: !(Maybe String)
   }
-  deriving (Show, Eq, Generic)
+  deriving (Show)
 
 combineToFilterSettings :: FilterConfiguration -> FilterSettings
 combineToFilterSettings FilterConfiguration {..} =
   let filterSettingGitignore = fromMaybe True filterConfigGitignore
       filterSettingFind = filterConfigFind
    in FilterSettings {..}
+
+data OutputSettings = OutputSettings
+  { outputSettingClear :: !Clear
+  }
+  deriving (Show)
 
 combineToOutputSettings :: OutputFlags -> OutputConfiguration -> OutputSettings
 combineToOutputSettings OutputFlags {..} mConf =
@@ -79,28 +78,47 @@ combineToOutputSettings OutputFlags {..} mConf =
           outputFlagClear <|> outputConfigClear mConf
    in OutputSettings {..}
 
+data HooksSettings = HooksSettings
+  { hooksSettingBeforeAll :: Maybe RunSettings,
+    hooksSettingAfterFirst :: Maybe RunSettings
+  }
+  deriving (Show)
+
+combineToHooksSettings :: HooksConfiguration -> IO HooksSettings
+combineToHooksSettings HooksConfiguration {..} = do
+  hooksSettingBeforeAll <- mapM combineToRunSettings hooksConfigurationBeforeAll
+  hooksSettingAfterFirst <- mapM combineToRunSettings hooksConfigurationAfterFirst
+  pure HooksSettings {..}
+
 data Configuration = Configuration
   { configLoops :: !(Map String LoopConfiguration),
     configOutputConfiguration :: !(Maybe OutputConfiguration)
   }
-  deriving stock (Show, Eq, Generic)
-  deriving (FromJSON, ToJSON) via (Autodocodec Configuration)
 
 instance HasCodec Configuration where
   codec =
     object "Configuration" $
       Configuration
-        <$> optionalFieldWithOmittedDefault' "loops" M.empty .= configLoops
-        <*> optionalField "output" "default output configuration" .= configOutputConfiguration
+        <$> optionalFieldWithOmittedDefault' "loops" M.empty
+          .= configLoops
+        <*> optionalField "output" "default output configuration"
+          .= configOutputConfiguration
+
+emptyConfiguration :: Configuration
+emptyConfiguration =
+  Configuration
+    { configLoops = mempty,
+      configOutputConfiguration = mempty
+    }
 
 data LoopConfiguration = LoopConfiguration
   { loopConfigDescription :: !(Maybe String),
     loopConfigRunConfiguration :: !RunConfiguration,
     loopConfigFilterConfiguration :: !FilterConfiguration,
-    loopConfigOutputConfiguration :: !OutputConfiguration
+    loopConfigOutputConfiguration :: !OutputConfiguration,
+    loopConfigHooksConfiguration :: !HooksConfiguration
   }
-  deriving stock (Show, Eq, Generic)
-  deriving (FromJSON, ToJSON) via (Autodocodec LoopConfiguration)
+  deriving (Eq)
 
 instance HasCodec LoopConfiguration where
   codec =
@@ -115,25 +133,27 @@ instance HasCodec LoopConfiguration where
       loopConfigDocs =
         [ "A LoopConfiguration specifies an entire feedback loop.",
           "",
-          "It consists of three parts:",
+          "It consists of four parts:",
           "* Filter Configuration: Which files to watch",
           "* Run Configuration: What to do when those files change",
-          "* Output Configuration: What to see"
+          "* Output Configuration: What to see",
+          "* Hooks configuration: What to around commands"
         ]
       f = \case
-        Left s -> makeLoopConfiguration (CommandArgs s)
+        Left s -> makeLoopConfiguration (CommandScript s)
         Right loopConfig -> loopConfig
       g loopConfig =
         let runConfig = loopConfigRunConfiguration loopConfig
             c = runConfigCommand runConfig
          in case c of
-              CommandArgs cmd | loopConfig == makeLoopConfiguration c -> Left cmd
+              CommandScript cmd | loopConfig == makeLoopConfiguration c -> Left cmd
               _ -> Right loopConfig
 
 loopConfigurationObjectCodec :: JSONObjectCodec LoopConfiguration
 loopConfigurationObjectCodec =
   LoopConfiguration
-    <$> optionalField "description" "description of when to use this feedback loop" .= loopConfigDescription
+    <$> optionalField "description" "description of when to use this feedback loop"
+      .= loopConfigDescription
     <*> parseAlternative
       (requiredField "run" "run configuration for this loop")
       runConfigurationObjectCodec
@@ -146,6 +166,10 @@ loopConfigurationObjectCodec =
       (requiredField "output" "output configuration for this loop")
       outputConfigurationObjectCodec
       .= loopConfigOutputConfiguration
+    <*> parseAlternative
+      (requiredField "hooks" "hooks configuration for this loop")
+      hooksConfigurationObjectCodec
+      .= loopConfigHooksConfiguration
 
 makeLoopConfiguration :: Command -> LoopConfiguration
 makeLoopConfiguration c =
@@ -153,7 +177,8 @@ makeLoopConfiguration c =
     { loopConfigDescription = Nothing,
       loopConfigRunConfiguration = makeRunConfiguration c,
       loopConfigFilterConfiguration = emptyFilterConfiguration,
-      loopConfigOutputConfiguration = emptyOutputConfiguration
+      loopConfigOutputConfiguration = emptyOutputConfiguration,
+      loopConfigHooksConfiguration = emptyHooksConfiguration
     }
 
 data RunConfiguration = RunConfiguration
@@ -161,20 +186,34 @@ data RunConfiguration = RunConfiguration
     runConfigExtraEnv :: !(Map String String),
     runConfigWorkingDir :: !(Maybe FilePath)
   }
-  deriving stock (Show, Eq, Generic)
-  deriving (FromJSON, ToJSON) via (Autodocodec RunConfiguration)
+  deriving (Eq)
 
 instance HasCodec RunConfiguration where
   codec =
     named "RunConfiguration" $
-      object "RunConfiguration" runConfigurationObjectCodec
+      dimapCodec f g $
+        eitherCodec
+          (codec <?> "A bare command without any extra configuration")
+          (object "RunConfiguration" runConfigurationObjectCodec)
+    where
+      f = \case
+        Left s -> makeRunConfiguration (CommandScript s)
+        Right loopConfig -> loopConfig
+      g runConfig =
+        let c = runConfigCommand runConfig
+         in case c of
+              CommandScript cmd | runConfig == makeRunConfiguration c -> Left cmd
+              _ -> Right runConfig
 
 runConfigurationObjectCodec :: JSONObjectCodec RunConfiguration
 runConfigurationObjectCodec =
   RunConfiguration
-    <$> commandObjectCodec .= runConfigCommand
-    <*> optionalFieldWithOmittedDefault "env" M.empty "extra environment variables to set" .= runConfigExtraEnv
-    <*> optionalField "working-dir" "where the process will be run" .= runConfigWorkingDir
+    <$> commandObjectCodec
+      .= runConfigCommand
+    <*> optionalFieldWithOmittedDefault "env" M.empty "extra environment variables to set"
+      .= runConfigExtraEnv
+    <*> optionalField "working-dir" "where the process will be run"
+      .= runConfigWorkingDir
 
 makeRunConfiguration :: Command -> RunConfiguration
 makeRunConfiguration c =
@@ -188,8 +227,7 @@ data FilterConfiguration = FilterConfiguration
   { filterConfigGitignore :: !(Maybe Bool),
     filterConfigFind :: !(Maybe String)
   }
-  deriving stock (Show, Eq, Generic)
-  deriving (FromJSON, ToJSON) via (Autodocodec FilterConfiguration)
+  deriving (Eq)
 
 instance HasCodec FilterConfiguration where
   codec =
@@ -208,8 +246,10 @@ instance HasCodec FilterConfiguration where
 filterConfigurationObjectCodec :: JSONObjectCodec FilterConfiguration
 filterConfigurationObjectCodec =
   FilterConfiguration
-    <$> optionalField "git" "whether to ignore files that are not in the git repo\nConcretely, this uses `git ls-files` to find files that are in the repo, so files that have been added but are also ignored by .gitignore will still be watched." .= filterConfigGitignore
-    <*> optionalField "find" "arguments for the 'find' command to find files to be notified about" .= filterConfigFind
+    <$> optionalField "git" "whether to ignore files that are not in the git repo\nConcretely, this uses `git ls-files` to find files that are in the repo, so files that have been added but are also ignored by .gitignore will still be watched."
+      .= filterConfigGitignore
+    <*> optionalField "find" "arguments for the 'find' command to find files to be notified about"
+      .= filterConfigFind
 
 emptyFilterConfiguration :: FilterConfiguration
 emptyFilterConfiguration =
@@ -221,8 +261,7 @@ emptyFilterConfiguration =
 data OutputConfiguration = OutputConfiguration
   { outputConfigClear :: !(Maybe Clear)
   }
-  deriving stock (Show, Eq, Generic)
-  deriving (FromJSON, ToJSON) via (Autodocodec OutputConfiguration)
+  deriving (Eq)
 
 instance HasCodec OutputConfiguration where
   codec =
@@ -232,7 +271,8 @@ instance HasCodec OutputConfiguration where
 outputConfigurationObjectCodec :: JSONObjectCodec OutputConfiguration
 outputConfigurationObjectCodec =
   OutputConfiguration
-    <$> optionalField "clear" "whether to clear the screen runs" .= outputConfigClear
+    <$> optionalField "clear" "whether to clear the screen runs"
+      .= outputConfigClear
 
 instance Semigroup OutputConfiguration where
   (<>) oc1 oc2 =
@@ -244,6 +284,32 @@ emptyOutputConfiguration :: OutputConfiguration
 emptyOutputConfiguration =
   OutputConfiguration
     { outputConfigClear = Nothing
+    }
+
+data HooksConfiguration = HooksConfiguration
+  { hooksConfigurationBeforeAll :: !(Maybe RunConfiguration),
+    hooksConfigurationAfterFirst :: !(Maybe RunConfiguration)
+  }
+  deriving (Eq)
+
+instance HasCodec HooksConfiguration where
+  codec =
+    named "HooksConfiguration" $
+      object "HooksConfiguration" hooksConfigurationObjectCodec
+
+hooksConfigurationObjectCodec :: JSONObjectCodec HooksConfiguration
+hooksConfigurationObjectCodec =
+  HooksConfiguration
+    <$> optionalField "before-all" "The hook to run before the first run"
+      .= hooksConfigurationBeforeAll
+    <*> optionalField "after-first" "The hook to run after the first run"
+      .= hooksConfigurationAfterFirst
+
+emptyHooksConfiguration :: HooksConfiguration
+emptyHooksConfiguration =
+  HooksConfiguration
+    { hooksConfigurationBeforeAll = Nothing,
+      hooksConfigurationAfterFirst = Nothing
     }
 
 getConfiguration :: Flags -> Environment -> IO (Maybe Configuration)
@@ -264,7 +330,6 @@ defaultConfigFile = do
 data Environment = Environment
   { envConfigFile :: !(Maybe FilePath)
   }
-  deriving (Show, Eq, Generic)
 
 getEnvironment :: IO Environment
 getEnvironment = Env.parse (Env.header "Environment") environmentParser
@@ -292,7 +357,7 @@ flagsParser =
     ( mconcat
         [ OptParse.progDesc versionStr,
           OptParse.fullDesc,
-          OptParse.footerDoc (Just $ OptParse.string footerStr)
+          OptParse.footerDoc (Just $ OptParse.pretty footerStr)
         ]
     )
   where
@@ -311,13 +376,11 @@ data Flags = Flags
     flagConfigFile :: !(Maybe FilePath),
     flagOutputFlags :: !OutputFlags
   }
-  deriving (Show, Eq, Generic)
 
 data OutputFlags = OutputFlags
   { outputFlagClear :: !(Maybe Clear),
     outputFlagDebug :: Bool
   }
-  deriving (Show, Eq, Generic)
 
 parseFlags :: OptParse.Parser Flags
 parseFlags =
@@ -326,7 +389,8 @@ parseFlags =
     <*> optional
       ( strOption
           ( mconcat
-              [ long "config-file",
+              [ short 'c',
+                long "config-file",
                 help "Path to an altenative config file",
                 metavar "FILEPATH"
               ]
@@ -344,15 +408,7 @@ parseCommandFlags =
                 completer (listIOCompleter defaultConfigFileCompleter)
               ]
           )
-      escapeChar = \case
-        '"' -> "\\\""
-        '\'' -> "\\\'"
-        c -> [c]
-      quote = ("\"" <>) . (<> "\"") . concatMap escapeChar
-      quoteIfNecessary "" = quote ""
-      quoteIfNecessary s = if ' ' `elem` s then quote s else s
-      pieceBackTogether = unwords . map quoteIfNecessary
-   in pieceBackTogether <$> many commandArg
+   in unwords <$> many commandArg
 
 defaultConfigFileCompleter :: IO [String]
 defaultConfigFileCompleter = do
@@ -363,29 +419,28 @@ parseOutputFlags :: OptParse.Parser OutputFlags
 parseOutputFlags =
   OutputFlags
     <$> parseClearFlag
-    <*> switch (mconcat [long "debug", help "show debug information"])
+    <*> switch
+      ( mconcat
+          [ short 'd',
+            long "debug",
+            help "show debug information"
+          ]
+      )
 
-data Command
-  = CommandArgs !String
-  | CommandScript !String
-  deriving (Show, Eq, Generic)
+newtype Command = CommandScript {unScript :: String}
+  deriving (Show, Eq)
+
+instance HasCodec Command where
+  codec = dimapCodec CommandScript unScript codec
 
 commandObjectCodec :: JSONObjectCodec Command
 commandObjectCodec =
-  dimapCodec f g $
-    eitherCodec
-      (requiredField "command" "the command to run on change")
-      (requiredField "script" "the script to run on change")
-  where
-    f = \case
-      Left c -> CommandArgs c
-      Right s -> CommandScript s
-    g = \case
-      CommandArgs c -> Left c
-      CommandScript s -> Right s
+  parseAlternative
+    (requiredField "script" "the script to run on change")
+    (requiredField "command" "the command to run on change (alias for 'script' for backward compatibility)")
 
 data Clear = ClearScreen | DoNotClearScreen
-  deriving (Show, Eq, Generic)
+  deriving (Show, Eq)
 
 instance HasCodec Clear where
   codec = dimapCodec f g codec
