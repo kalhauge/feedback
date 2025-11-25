@@ -6,7 +6,7 @@
   };
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs?ref=nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs?ref=nixos-25.05";
     pre-commit-hooks.url = "github:cachix/pre-commit-hooks.nix";
     weeder-nix.url = "github:NorfairKing/weeder-nix";
     weeder-nix.flake = false;
@@ -42,6 +42,7 @@
         { systems ? [
             "x86_64-linux"
             "x86_64-darwin"
+            "aarch64-linux"
           ]
         , do
         ,
@@ -49,8 +50,7 @@
         nixpkgs.lib.genAttrs systems (
           system:
           let
-            pkgsFor =
-              nixpkgs:
+            pkgsFor = nixpkgs:
               import nixpkgs {
                 inherit system;
                 config.allowUnfree = true;
@@ -74,19 +74,16 @@
     in
     {
       packages = forEachSystem {
-        do =
-          { pkgs, ... }:
-          {
-            default = pkgs.feedback;
-          };
+        do = { pkgs, ... }: {
+          default = pkgs.feedback;
+        };
       };
       checks = forEachSystem {
         do =
           { system
           , pkgs
           , ...
-          }:
-          {
+          }: {
             release = self.packages.${system}.default;
             shell = self.devShells.${system}.default;
             coverage-report = pkgs.dekking.makeCoverageReport {
@@ -120,8 +117,7 @@
           { pkgs
           , system
           , ...
-          }:
-          {
+          }: {
             default = pkgs.haskellPackages.shellFor {
               name = "feedback-shell";
               packages = p: [
@@ -130,8 +126,7 @@
               ];
               withHoogle = true;
               doBenchmark = true;
-              buildInputs =
-                with pkgs;
+              buildInputs = with pkgs;
                 [
                   zlib
                   cabal-install

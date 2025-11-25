@@ -365,7 +365,7 @@ flagsParser =
       "Version: " <> showVersion version
     footerStr =
       unlines
-        [ Env.helpDoc environmentParser,
+        [ Env.helpDoc 80 environmentParser,
           "",
           "Configuration file format:",
           T.unpack (renderColouredSchemaViaCodec @Configuration)
@@ -391,7 +391,7 @@ parseFlags =
           ( mconcat
               [ short 'c',
                 long "config-file",
-                help "Path to an altenative config file",
+                help "Path to an alternative config file",
                 metavar "FILEPATH"
               ]
           )
